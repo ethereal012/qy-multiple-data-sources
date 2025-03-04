@@ -13,7 +13,7 @@ import org.springframework.context.annotation.Configuration;
 @SpringBootApplication
 @Configuration
 @MapperScan(
-        basePackages = "com.example.mine.mapper",
+        basePackages = "com.qy.data.work.mapper",
         sqlSessionFactoryRef = "sourceSqlSessionFactory"
 )
 public class Bootstrap {
