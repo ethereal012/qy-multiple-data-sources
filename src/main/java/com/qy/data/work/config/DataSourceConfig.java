@@ -1,4 +1,4 @@
-package com.example.mine.config;
+package com.qy.data.work.config;
 
 import com.baomidou.mybatisplus.extension.spring.MybatisSqlSessionFactoryBean;
 import org.apache.ibatis.session.SqlSessionFactory;

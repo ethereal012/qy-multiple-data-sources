@@ -1,4 +1,4 @@
-package com.example.mine;
+package com.qy.data.work;
 
 import org.mybatis.spring.annotation.MapperScan;
 import org.slf4j.Logger;
