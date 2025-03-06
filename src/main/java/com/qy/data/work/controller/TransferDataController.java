@@ -40,63 +40,73 @@ public class TransferDataController {
     protected ThreadPoolExecutor executor = null;
 
     /**
-     * 较快 VALUES
-     *
-     * @param tableName 表名
+     * 多线程迁移数据
+     * @param tableName 标签
      * @return boolean
      */
-    @PostMapping("/transferData")
-    public Boolean transferData(@RequestParam String tableName) {
+    @PostMapping("/transferDataThread")
+    public Boolean transferDataThread(@RequestParam String tableName) {
         long start = System.currentTimeMillis();
-        Connection connection = null;
+        // 三个原子变量
+        AtomicLong lastId = new AtomicLong(8663);
+        AtomicInteger totalInserted = new AtomicInteger();
+        AtomicBoolean hasMoreData = new AtomicBoolean(true);
+        AtomicBoolean isCommit = new AtomicBoolean(false);
+        // 每批次数
+        int batchSize = 10000;
+        executor = new ThreadPoolExecutor(2, 4, 0L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>(10), new ThreadPoolExecutor.CallerRunsPolicy());
         try {
-            // 获取数据库连接
-            connection = Objects.requireNonNull(target.getDataSource()).getConnection();
-            connection.setAutoCommit(false);
+            Runnable transferTask = () -> {
+                // 每个线程独立的connection
+                try (Connection connection = Objects.requireNonNull(target.getDataSource()).getConnection()) {
+                    connection.setAutoCommit(false);
 
-//            // 1. 从source库中获取表结构
-//            String createTableSql = "SHOW CREATE TABLE " + tableName;
-//            Map<String, Object> createTableResult = source.query(createTableSql, rs -> {
-//                if (rs.next()) {
-//                    return Map.of("Create Table", rs.getString(2));
-//                }
-//                return null;
-//            });
-//
-//            String createTableStatement = null;
-//            if (createTableResult != null) {
-//                createTableStatement = (String) createTableResult.get("Create Table");
-//            } else {
-//                log.error("表{}未查询到建表语句", tableName);
-//            }
-//
-//            if (StringUtils.isNotBlank(createTableStatement)) {
-//                // 2. 在target库中创建表
-//                target.execute(createTableStatement);
-//            }
+                    operateData(tableName, lastId, totalInserted, hasMoreData, batchSize, connection);
 
-            // 3. 分批次从source中获取数据并插入target
-            int batchSize = 10000;
-            // 记录上次查询的最大ID
-            long lastId = 8663;
-            long endId = lastId + batchSize;
-            // 记录已插入的数据总数
-            int totalInserted = 0;
-            boolean hasMoreData = true;
-            while (hasMoreData) {
+                    if (totalInserted.get() > 0 && isCommit.compareAndSet(false, true)) {
+                        connection.commit();
+                        log.info("线程：{}已提交剩余事务，迁移 {} 条数据",Thread.currentThread().getName(), totalInserted.get());
+                    }
+
+                } catch (SQLException e) {
+                    log.error("数据迁移过程中发生错误：", e);
+                }
+            };
+
+            while (hasMoreData.get()) {
+                executor.submit(transferTask);
+            }
+
+            executor.shutdown();
+            while (!executor.isTerminated()) {
+                Thread.sleep(1000);
+            }
+
+            log.info("数据迁移完成，共耗时：{}毫秒", (System.currentTimeMillis() - start));
+            return true;
+
+        } catch (Exception e) {
+            log.error("数据迁移失败：", e);
+            return false;
+        }
+    }
+
+    private void operateData(String tableName, AtomicLong lastId, AtomicInteger totalInserted, AtomicBoolean hasMoreData, int batchSize, Connection connection) throws SQLException {
+        while (hasMoreData.get()) {
+            long startId = lastId.get();
+            long endId = startId + batchSize;
+
+            // 确保只有一个线程能成功更新 lastId
+            if (lastId.compareAndSet(startId, endId)) {
+                log.info("线程：{}已更新lastId为：{}", Thread.currentThread().getName(), lastId.get());
                 long startSelect = System.currentTimeMillis();
-                String selectDataSql = "SELECT * FROM " + tableName +
-                        " WHERE id > " + lastId + " AND id <= " + endId;
-                List<Map<String, Object>> rows = source.queryForList(selectDataSql);
+                String selectDataSql = "SELECT * FROM " + tableName + " WHERE id > ? AND id <= ?";
+                List<Map<String, Object>> rows = source.queryForList(selectDataSql, startId, endId);
                 log.info("{}条数据查询用时：{}毫秒", rows.size(), (System.currentTimeMillis() - startSelect));
                 if (rows.isEmpty()) {
-                    hasMoreData = false;
-                    continue;
+                    hasMoreData.set(false);
+                    break;
                 }
-
-                // 更新
-                lastId = (Long) rows.get(rows.size() - 1).get("id");
-                endId = lastId + batchSize;
 
                 // 构建批量插入SQL
                 long startInsert = System.currentTimeMillis();
@@ -115,17 +125,47 @@ public class TransferDataController {
                 }
                 batchInsertSql.setLength(batchInsertSql.length() - 1);
 
-                // 执行批量插入
                 target.execute(batchInsertSql.toString());
                 log.info("{}条数据插入用时：{}毫秒", rows.size(), (System.currentTimeMillis() - startInsert));
 
-                totalInserted += rows.size();
-                if (totalInserted >= 300000) {
+                totalInserted.addAndGet(rows.size());
+
+                if (totalInserted.get() >= 300000) {
                     connection.commit();
-                    log.info("已提交事务，迁移 {} 条数据", totalInserted);
-                    totalInserted = 0;
+                    log.info("线程：{}已提交事务，迁移 {} 条数据", Thread.currentThread().getName(), totalInserted.get());
+                    totalInserted.set(0);
                 }
             }
+        }
+    }
+
+    /**
+     * 较快 VALUE 多条数据 单线程
+     * @param tableName 表名
+     * @return boolean
+     */
+    @PostMapping("/transferData")
+    public Boolean transferData(@RequestParam String tableName) {
+        long start = System.currentTimeMillis();
+        Connection connection = null;
+        try {
+            // 获取数据库连接
+            connection = Objects.requireNonNull(target.getDataSource()).getConnection();
+            connection.setAutoCommit(false);
+
+            // 迁移表结构的
+//            transferTableStructure(tableName);
+
+            // 3. 分批次从source中获取数据并插入target
+            int batchSize = 10000;
+            // 记录上次查询的最大ID
+            long lastId = 8663;
+            long endId = lastId + batchSize;
+            // 记录已插入的数据总数
+            int totalInserted = 0;
+            boolean hasMoreData = true;
+
+            totalInserted = operateData(tableName, connection, batchSize, lastId, endId, totalInserted, hasMoreData);
 
             // 提交剩余未提交的数据
             if (totalInserted > 0) {
@@ -158,102 +198,56 @@ public class TransferDataController {
     }
 
     /**
-     * 多线程迁移数据
-     * @param tableName 标签
-     * @return boolean
+     * 单线程处理数据时，只用返回一个totalInserted，判断是否有剩余数据未提交
      */
-    @PostMapping("/transferDataThread")
-    public Boolean transferDataThread(@RequestParam String tableName) {
-        long start = System.currentTimeMillis();
-        // 三个原子变量
-        AtomicLong lastId = new AtomicLong(3765978);
-        AtomicInteger totalInserted = new AtomicInteger();
-        AtomicBoolean hasMoreData = new AtomicBoolean(true);
-        // 每批次数
-        int batchSize = 10000;
-        executor = new ThreadPoolExecutor(2, 4, 0L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>(10), new ThreadPoolExecutor.CallerRunsPolicy());
-        try {
-            Runnable transferTask = () -> {
-                // 每个线程独立的connection
-                try (Connection connection = Objects.requireNonNull(target.getDataSource()).getConnection()) {
-                    connection.setAutoCommit(false);
+    private int operateData(String tableName, Connection connection, int batchSize, long lastId, long endId, int totalInserted, boolean hasMoreData) throws SQLException {
+        while (hasMoreData) {
+            long startSelect = System.currentTimeMillis();
+            String selectDataSql = "SELECT * FROM " + tableName + " WHERE id > ? AND id <= ?";
+            List<Map<String, Object>> rows = source.queryForList(selectDataSql, lastId, endId);
+            log.info("{}条数据查询用时：{}毫秒", rows.size(), (System.currentTimeMillis() - startSelect));
+            if (rows.isEmpty()) {
+                hasMoreData = false;
+                continue;
+            }
 
-                    while (hasMoreData.get()) {
-                        long startId = lastId.get();
-                        long endId = startId + batchSize;
+            // 更新
+            lastId = (Long) rows.get(rows.size() - 1).get("id");
+            endId = lastId + batchSize;
 
-                        long startSelect = System.currentTimeMillis();
-                        String selectDataSql = "SELECT * FROM " + tableName + " WHERE id > ? AND id <= ?";
-                        List<Map<String, Object>> rows = source.queryForList(selectDataSql, startId, endId);
-                        log.info("{}条数据查询用时：{}毫秒", rows.size(), (System.currentTimeMillis() - startSelect));
-                        if (rows.isEmpty()) {
-                            hasMoreData.set(false);
-                            break;
-                        }
-
-                        lastId.set((Long) rows.get(rows.size() - 1).get("id"));
-                        log.info("线程：{}已更新lastId为：{}",Thread.currentThread().getName(), lastId.get());
-
-                        // 构建批量插入SQL
-                        long startInsert = System.currentTimeMillis();
-                        StringBuilder batchInsertSql = new StringBuilder("INSERT INTO " + tableName + " VALUE ");
-                        for (Map<String, Object> row : rows) {
-                            batchInsertSql.append("(");
-                            for (Object value : row.values()) {
-                                if (value == null) {
-                                    batchInsertSql.append("NULL,");
-                                } else {
-                                    batchInsertSql.append("'").append(value.toString().replace("'", "''")).append("',");
-                                }
-                            }
-                            batchInsertSql.setLength(batchInsertSql.length() - 1);
-                            batchInsertSql.append("),");
-                        }
-                        batchInsertSql.setLength(batchInsertSql.length() - 1);
-
-                        target.execute(batchInsertSql.toString());
-                        log.info("{}条数据插入用时：{}毫秒", rows.size(), (System.currentTimeMillis() - startInsert));
-
-                        totalInserted.addAndGet(rows.size());
-
-                        if (totalInserted.get() >= 300000) {
-                            connection.commit();
-                            log.info("已提交事务，迁移 {} 条数据", totalInserted.get());
-                            totalInserted.set(0);
-                        }
+            // 构建批量插入SQL
+            long startInsert = System.currentTimeMillis();
+            StringBuilder batchInsertSql = new StringBuilder("INSERT INTO " + tableName + " VALUE ");
+            for (Map<String, Object> row : rows) {
+                batchInsertSql.append("(");
+                for (Object value : row.values()) {
+                    if (value == null) {
+                        batchInsertSql.append("NULL,");
+                    } else {
+                        batchInsertSql.append("'").append(value.toString().replace("'", "''")).append("',");
                     }
-
-                    if (totalInserted.get() > 0) {
-                        connection.commit();
-                        log.info("已提交剩余事务，迁移 {} 条数据", totalInserted.get());
-                    }
-
-                } catch (SQLException e) {
-                    log.error("数据迁移过程中发生错误：", e);
                 }
-            };
-
-            while (hasMoreData.get()) {
-                executor.submit(transferTask);
+                batchInsertSql.setLength(batchInsertSql.length() - 1);
+                batchInsertSql.append("),");
             }
+            batchInsertSql.setLength(batchInsertSql.length() - 1);
 
-            executor.shutdown();
-            while (!executor.isTerminated()) {
-                Thread.sleep(1000);
+            // 执行批量插入
+            target.execute(batchInsertSql.toString());
+            log.info("{}条数据插入用时：{}毫秒", rows.size(), (System.currentTimeMillis() - startInsert));
+
+            totalInserted += rows.size();
+            if (totalInserted >= 300000) {
+                connection.commit();
+                log.info("已提交事务，迁移 {} 条数据", totalInserted);
+                totalInserted = 0;
             }
-
-            log.info("数据迁移完成，共耗时：{}毫秒", (System.currentTimeMillis() - start));
-            return true;
-
-        } catch (Exception e) {
-            log.error("数据迁移失败：", e);
-            return false;
         }
+        return totalInserted;
     }
 
-
     /**
-     * 较慢
+     * 较慢 单线程 单条数据插入
      * @param tableName 表名
      * @return boolean
      */
@@ -267,44 +261,30 @@ public class TransferDataController {
             connection = Objects.requireNonNull(target.getDataSource()).getConnection();
             connection.setAutoCommit(false);
 
-            // 1. 从source库中获取表结构
-            String createTableSql = "SHOW CREATE TABLE " + tableName;
-            Map<String, Object> createTableResult = source.query(createTableSql, rs -> {
-                if (rs.next()) {
-                    return Map.of("Create Table", rs.getString(2));
-                }
-                return null;
-            });
-
-            String createTableStatement = null;
-            if (createTableResult != null) {
-                createTableStatement = (String) createTableResult.get("Create Table");
-            } else {
-                log.error("表{}未查询到建表语句", tableName);
-            }
-
-            if (StringUtils.isNotBlank(createTableStatement)) {
-                // 2. 在target库中创建表
-                target.execute(createTableStatement);
-            }
+            transferTableStructure(tableName);
 
             // 3. 分批次从source中获取数据并插入target
             int batchSize = 100000;
-            long offset = 0;
+            // 记录上次查询的最大ID
+            long lastId = 8663;
+            long endId = lastId + batchSize;
             boolean hasMoreData = true;
             int insertCount = 0;
-            String insertSql = "INSERT INTO " + tableName + " VALUES (";
+            String insertSql = "INSERT INTO " + tableName + " VALUE (";
             while (hasMoreData) {
                 // 分页查询数据
                 long startSelect = System.currentTimeMillis();
-                String selectDataSql = "SELECT * FROM " + tableName +
-                        " LIMIT " + batchSize + " OFFSET " + offset;
-                List<Map<String, Object>> rows = source.queryForList(selectDataSql);
+                String selectDataSql = "SELECT * FROM " + tableName + " WHERE id > ? AND id <= ?";
+                List<Map<String, Object>> rows = source.queryForList(selectDataSql, lastId, endId);
                 log.info("{}条数据查询用时：{}毫秒", rows.size(), (System.currentTimeMillis() - startSelect));
                 if (rows.isEmpty()) {
                     hasMoreData = false;
                     continue;
                 }
+
+                // 更新
+                lastId = (Long) rows.get(rows.size() - 1).get("id");
+                endId = lastId + batchSize;
 
                 // 准备批量插入
                 long startInsert = System.currentTimeMillis();
@@ -336,7 +316,6 @@ public class TransferDataController {
                 }
                 log.info("{}条数据插入用时：{}毫秒", rows.size(), (System.currentTimeMillis() - startInsert));
 
-                offset += batchSize;
                 log.info("已完成迁移 {} 条数据", insertCount);
             }
 
@@ -372,5 +351,27 @@ public class TransferDataController {
         }
     }
 
+    private void transferTableStructure(String tableName) {
+        // 1. 从source库中获取表结构
+        String createTableSql = "SHOW CREATE TABLE " + tableName;
+        Map<String, Object> createTableResult = source.query(createTableSql, rs -> {
+            if (rs.next()) {
+                return Map.of("Create Table", rs.getString(2));
+            }
+            return null;
+        });
+
+        String createTableStatement = null;
+        if (createTableResult != null) {
+            createTableStatement = (String) createTableResult.get("Create Table");
+        } else {
+            log.error("表{}未查询到建表语句", tableName);
+        }
+
+        if (StringUtils.isNotBlank(createTableStatement)) {
+            // 2. 在target库中创建表
+            target.execute(createTableStatement);
+        }
+    }
 
 }
