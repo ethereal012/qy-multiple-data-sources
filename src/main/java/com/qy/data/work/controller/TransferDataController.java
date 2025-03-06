@@ -47,48 +47,88 @@ public class TransferDataController {
     @PostMapping("/transferDataThread")
     public Boolean transferDataThread(@RequestParam String tableName) {
         long start = System.currentTimeMillis();
-        // 三个原子变量
+        // 线程共享的原子变量
         AtomicLong lastId = new AtomicLong(8663);
         AtomicInteger totalInserted = new AtomicInteger();
         AtomicBoolean hasMoreData = new AtomicBoolean(true);
+        AtomicBoolean isShuttingDown = new AtomicBoolean(false);
         AtomicBoolean isCommit = new AtomicBoolean(false);
-        // 每批次数
+        // 每批次查询条数
         int batchSize = 10000;
-        executor = new ThreadPoolExecutor(2, 4, 0L, TimeUnit.MILLISECONDS, new LinkedBlockingQueue<>(10), new ThreadPoolExecutor.CallerRunsPolicy());
+        // 最大线程数
+        int threadCount = 10;
+        CountDownLatch latch = new CountDownLatch(threadCount);
+        executor = new ThreadPoolExecutor(5, threadCount, 0L, TimeUnit.MILLISECONDS,
+                new LinkedBlockingQueue<>(10),
+                new ThreadPoolExecutor.CallerRunsPolicy());
+
         try {
-            Runnable transferTask = () -> {
-                // 每个线程独立的connection
-                try (Connection connection = Objects.requireNonNull(target.getDataSource()).getConnection()) {
-                    connection.setAutoCommit(false);
+            for (int i = 0; i < threadCount; i++) {
+                executor.submit(() -> {
+                    try (Connection connection = Objects.requireNonNull(target.getDataSource()).getConnection()) {
+                        connection.setAutoCommit(false);
 
-                    operateData(tableName, lastId, totalInserted, hasMoreData, batchSize, connection);
+                        operateData(tableName, lastId, totalInserted, hasMoreData, batchSize, connection);
 
-                    if (totalInserted.get() > 0 && isCommit.compareAndSet(false, true)) {
-                        connection.commit();
-                        log.info("线程：{}已提交剩余事务，迁移 {} 条数据",Thread.currentThread().getName(), totalInserted.get());
+                        if (totalInserted.get() > 0 && isCommit.compareAndSet(false, true)) {
+                            connection.commit();
+                            log.info("线程：{}已提交剩余事务，迁移 {} 条数据",Thread.currentThread().getName(), totalInserted.get());
+                        }
+
+                    } catch (SQLException e) {
+                        log.error("数据迁移过程中发生 SQL 错误：", e);
+                    } finally {
+                        latch.countDown();
                     }
+                });
+            }
 
-                } catch (SQLException e) {
-                    log.error("数据迁移过程中发生错误：", e);
+            // Shutdown Hook，确保异常退出时提交事务
+            Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                log.warn("程序异常中断，正在等待所有线程完成...");
+                isShuttingDown.set(true);
+                // 终止所有线程
+                hasMoreData.set(false);
+
+                try {
+                    // 等待所有线程执行完毕
+                    latch.await();
+                    executor.shutdown();
+                    log.warn("所有线程已结束，最终的 lastId: {}", lastId.get());
+
+                    // 确保所有剩余数据提交
+                    commitUnfinishedTransactions(totalInserted);
+
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
                 }
-            };
+            }));
 
-            while (hasMoreData.get()) {
-                executor.submit(transferTask);
-            }
+            // 等待所有线程完成
+            latch.await();
 
+        } catch (InterruptedException e) {
+            log.error("主线程被中断，最后的 lastId: {}", lastId.get(), e);
+            Thread.currentThread().interrupt();
+        } finally {
             executor.shutdown();
-            while (!executor.isTerminated()) {
-                Thread.sleep(1000);
+            try {
+                if (!executor.awaitTermination(10, TimeUnit.SECONDS)) {
+                    executor.shutdownNow();
+                }
+            } catch (InterruptedException ex) {
+                executor.shutdownNow();
+                Thread.currentThread().interrupt();
             }
 
-            log.info("数据迁移完成，共耗时：{}毫秒", (System.currentTimeMillis() - start));
-            return true;
+            // 确保所有线程完成后，提交未提交的数据
+            commitUnfinishedTransactions(totalInserted);
 
-        } catch (Exception e) {
-            log.error("数据迁移失败：", e);
-            return false;
+            log.info("数据迁移完成，最终的 lastId: {}", lastId.get());
+            log.info("总耗时: {} 毫秒", (System.currentTimeMillis() - start));
         }
+
+        return !hasMoreData.get();
     }
 
     private void operateData(String tableName, AtomicLong lastId, AtomicInteger totalInserted, AtomicBoolean hasMoreData, int batchSize, Connection connection) throws SQLException {
@@ -138,6 +178,20 @@ public class TransferDataController {
             }
         }
     }
+
+    private void commitUnfinishedTransactions(AtomicInteger totalInserted) {
+        try (Connection connection = Objects.requireNonNull(target.getDataSource()).getConnection()) {
+            connection.setAutoCommit(false);
+            if (totalInserted.get() > 0) {
+                connection.commit();
+                log.info("所有线程已结束，最终提交剩余数据: {} 条", totalInserted.get());
+                totalInserted.set(0);
+            }
+        } catch (SQLException e) {
+            log.error("提交剩余事务时发生错误：", e);
+        }
+    }
+
 
     /**
      * 较快 VALUE 多条数据 单线程
