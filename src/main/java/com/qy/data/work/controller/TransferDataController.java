@@ -192,14 +192,13 @@ public class TransferDataController {
         }
     }
 
-
     /**
-     * 较快 VALUE 多条数据 单线程
+     * 较快 VALUE 多条数据 单线程 适用于小数据量 id为字符串或者整型且不规则的情况
      * @param tableName 表名
      * @return boolean
      */
-    @PostMapping("/transferData")
-    public Boolean transferData(@RequestParam String tableName) {
+    @PostMapping("/transferDataCommon")
+    public Boolean transferDataCommon(@RequestParam String tableName) {
         long start = System.currentTimeMillis();
         Connection connection = null;
         try {
@@ -207,19 +206,128 @@ public class TransferDataController {
             connection = Objects.requireNonNull(target.getDataSource()).getConnection();
             connection.setAutoCommit(false);
 
-            // 迁移表结构的
-//            transferTableStructure(tableName);
+            int batchSize = 10000;
+            String lastId = "";
+            int totalInserted = 0;
+            boolean hasMoreData = true;
+
+            totalInserted = operateDataCommon(tableName, connection, batchSize, lastId, totalInserted, hasMoreData);
+
+            // 提交剩余未提交的数据
+            if (totalInserted > 0) {
+                connection.commit();
+                log.info("已提交剩余事务，迁移 {} 条数据", totalInserted);
+            }
+
+            log.info("数据迁移完成，共耗时：{}毫秒", (System.currentTimeMillis() - start));
+            return true;
+        } catch (Exception e) {
+            if (connection != null) {
+                try {
+                    connection.rollback();
+                } catch (SQLException rollbackEx) {
+                    log.error("事务回滚失败：", rollbackEx);
+                }
+            }
+            log.error("数据迁移失败：", e);
+            return false;
+        } finally {
+            if (connection != null) {
+                try {
+                    connection.setAutoCommit(true);
+                    connection.close();
+                } catch (SQLException closeEx) {
+                    log.error("关闭连接失败：", closeEx);
+                }
+            }
+        }
+    }
+
+    /**
+     * 适配 String 类型的 id 进行批量查询和插入
+     */
+    private int operateDataCommon(String tableName, Connection connection, int batchSize, String lastId, int totalInserted, boolean hasMoreData) throws SQLException {
+        while (hasMoreData) {
+            long startSelect = System.currentTimeMillis();
+
+            String selectDataSql;
+            List<Map<String, Object>> rows;
+
+            if (lastId.isEmpty()) {
+                // 初始查询，不使用 lastId 过滤
+                selectDataSql = "SELECT * FROM " + tableName + " ORDER BY id LIMIT ?";
+                rows = source.queryForList(selectDataSql, batchSize);
+            } else {
+                // 继续查询，使用 lastId 作为偏移
+                selectDataSql = "SELECT * FROM " + tableName + " WHERE id > ? ORDER BY id LIMIT ?";
+                rows = source.queryForList(selectDataSql, lastId, batchSize);
+            }
+
+            log.info("{}条数据查询用时：{}毫秒", rows.size(), (System.currentTimeMillis() - startSelect));
+            if (rows.isEmpty()) {
+                hasMoreData = false;
+                continue;
+            }
+
+            // 更新 lastId
+            lastId = rows.get(rows.size() - 1).get("id").toString();
+
+            // 构建批量插入SQL
+            long startInsert = System.currentTimeMillis();
+            StringBuilder batchInsertSql = new StringBuilder("INSERT INTO " + tableName + " VALUES ");
+            for (Map<String, Object> row : rows) {
+                batchInsertSql.append("(");
+                for (Object value : row.values()) {
+                    if (value == null) {
+                        batchInsertSql.append("NULL,");
+                    } else {
+                        batchInsertSql.append("'").append(value.toString().replace("'", "''")).append("',");
+                    }
+                }
+                batchInsertSql.setLength(batchInsertSql.length() - 1);
+                batchInsertSql.append("),");
+            }
+            batchInsertSql.setLength(batchInsertSql.length() - 1);
+
+            // 执行批量插入
+            target.execute(batchInsertSql.toString());
+            log.info("{}条数据插入用时：{}毫秒", rows.size(), (System.currentTimeMillis() - startInsert));
+
+            totalInserted += rows.size();
+            if (totalInserted >= 300000) {
+                connection.commit();
+                log.info("已提交事务，迁移 {} 条数据", totalInserted);
+                totalInserted = 0;
+            }
+        }
+        return totalInserted;
+    }
+
+
+    /**
+     * 较快 VALUE 多条数据 单线程 适用于小数据量 id为整型且比较规则的情况
+     * @param tableName 表名
+     * @return boolean
+     */
+    @PostMapping("/transferDataForInt")
+    public Boolean transferDataForInt(@RequestParam String tableName) {
+        long start = System.currentTimeMillis();
+        Connection connection = null;
+        try {
+            // 获取数据库连接
+            connection = Objects.requireNonNull(target.getDataSource()).getConnection();
+            connection.setAutoCommit(false);
 
             // 3. 分批次从source中获取数据并插入target
             int batchSize = 10000;
             // 记录上次查询的最大ID
-            long lastId = 8663;
+            long lastId = 0;
             long endId = lastId + batchSize;
             // 记录已插入的数据总数
             int totalInserted = 0;
             boolean hasMoreData = true;
 
-            totalInserted = operateData(tableName, connection, batchSize, lastId, endId, totalInserted, hasMoreData);
+            totalInserted = operateDataForInt(tableName, connection, batchSize, lastId, endId, totalInserted, hasMoreData);
 
             // 提交剩余未提交的数据
             if (totalInserted > 0) {
@@ -254,7 +362,7 @@ public class TransferDataController {
     /**
      * 单线程处理数据时，只用返回一个totalInserted，判断是否有剩余数据未提交
      */
-    private int operateData(String tableName, Connection connection, int batchSize, long lastId, long endId, int totalInserted, boolean hasMoreData) throws SQLException {
+    private int operateDataForInt(String tableName, Connection connection, int batchSize, long lastId, long endId, int totalInserted, boolean hasMoreData) throws SQLException {
         while (hasMoreData) {
             long startSelect = System.currentTimeMillis();
             String selectDataSql = "SELECT * FROM " + tableName + " WHERE id > ? AND id <= ?";
@@ -305,8 +413,8 @@ public class TransferDataController {
      * @param tableName 表名
      * @return boolean
      */
-    @PostMapping("/transferData1")
-    public boolean transferData1(@RequestParam String tableName) {
+    @PostMapping("/transferDataByOne")
+    public boolean transferDataByOne(@RequestParam String tableName) {
         long start = System.currentTimeMillis();
         Connection connection = null;
         PreparedStatement ps = null;
@@ -320,7 +428,7 @@ public class TransferDataController {
             // 3. 分批次从source中获取数据并插入target
             int batchSize = 100000;
             // 记录上次查询的最大ID
-            long lastId = 8663;
+            long lastId = 0;
             long endId = lastId + batchSize;
             boolean hasMoreData = true;
             int insertCount = 0;
