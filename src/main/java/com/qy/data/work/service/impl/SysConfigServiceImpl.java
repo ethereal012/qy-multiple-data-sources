@@ -21,8 +21,13 @@ public class SysConfigServiceImpl extends ServiceImpl<SysConfigMapper, SysConfig
     @Autowired
     private SysConfigMapper sysConfigMapper;
 
+    /**
+     * 方法上@DS优先级高于类上@DS
+     * @return String
+     */
     @Override
-    public String getName0() {
+    @DS("target")
+    public String getName() {
         SysConfig sysConfig = sysConfigMapper.selectById("diagnostics.allow_i_s_tables");
         return sysConfig.getValue();
     }

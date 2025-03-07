@@ -10,6 +10,6 @@ import com.baomidou.mybatisplus.extension.service.IService;
 */
 public interface SysConfigService extends IService<SysConfig> {
 
-    String getName0();
+    String getName();
 
 }
