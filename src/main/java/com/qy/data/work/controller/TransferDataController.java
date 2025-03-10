@@ -156,6 +156,8 @@ public class TransferDataController {
                     for (Object value : row.values()) {
                         if (value == null) {
                             batchInsertSql.append("NULL,");
+                        } else if (value instanceof Boolean) {
+                            batchInsertSql.append(Boolean.TRUE.equals((value)) ? "1," : "0,");
                         } else {
                             batchInsertSql.append("'").append(value.toString().replace("'", "''")).append("',");
                         }
@@ -280,6 +282,8 @@ public class TransferDataController {
                 for (Object value : row.values()) {
                     if (value == null) {
                         batchInsertSql.append("NULL,");
+                    } else if (value instanceof Boolean) {
+                        batchInsertSql.append(Boolean.TRUE.equals((value)) ? "1," : "0,");
                     } else {
                         batchInsertSql.append("'").append(value.toString().replace("'", "''")).append("',");
                     }
@@ -385,6 +389,8 @@ public class TransferDataController {
                 for (Object value : row.values()) {
                     if (value == null) {
                         batchInsertSql.append("NULL,");
+                    } else if (value instanceof Boolean) {
+                        batchInsertSql.append(Boolean.TRUE.equals((value)) ? "1," : "0,");
                     } else {
                         batchInsertSql.append("'").append(value.toString().replace("'", "''")).append("',");
                     }
